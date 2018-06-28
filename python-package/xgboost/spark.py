@@ -11,6 +11,30 @@ from pyspark.ml.wrapper import JavaModel
 __all__ = ['XGBoost', 'XGBoostModel']
 
 
+def _update_params(sc, params):
+    params = dict(params or {})
+
+    max_nthread = int(sc.getConf().get('spark.task.cpus', '1'))
+    max_cores = int(sc.getConf().get('spark.cores.max'))
+    exec_cores = int(sc.getConf().get('spark.executor.cores'))
+
+    expected_executors = int(max_cores / exec_cores)
+    expected_workers = expected_executors * int(exec_cores / max_nthread)
+
+    params.setdefault('nthread', max_nthread)
+    params.setdefault('nworkers', expected_workers)
+    params.setdefault('num_round', 10)  # Default from the python api
+
+    # For compatibility with https://github.com/dmlc/xgboost/pull/3387
+    params.setdefault('num_workers', params['nworkers'])
+    if 'train_test_ratio' in params:
+        params['trainTestRatio'] = params['train_test_ratio']
+    if 'num_early_stopping_rounds' in params:
+        params['numEarlyStoppingRounds'] = params['num_early_stopping_rounds']
+
+    return params
+
+
 class XGBoost(JavaEstimator, JavaMLReadable, JavaMLWritable):
     """PySpark estimator for XGBoost models.
     """
@@ -30,12 +54,10 @@ class XGBoost(JavaEstimator, JavaMLReadable, JavaMLWritable):
             Example options: reg:logistic, rank:pairwise
 
         Additionally, xgboost4j supports the following options:
-        - trainTestRatio: Percent of data to use for training.
-        - numEarlyStoppingRounds: Rounds to terminate after following no improvement to metric.
+        - train_test_ratio: Percent of data to use for training.
+        - num_early_stopping_rounds: Rounds to terminate after following no improvement to metric.
 
-        >>> path = <S3 path>
         >>> params = { .. }
-        >>> data = dataset.LabeledPointFormat().read_dataframe(path)
         >>> model = xgb.XGBoost(params).fit(data)
         >>> model
         XGBoostRegressionModel_d76bf6ebdb03
@@ -44,26 +66,24 @@ class XGBoost(JavaEstimator, JavaMLReadable, JavaMLWritable):
         """
         super(XGBoost, self).__init__()
         sc = SparkContext.getOrCreate()
-        params = dict(params or {})
+        params = _update_params(sc, params)
 
-        max_nthread = int(sc.getConf().get('spark.task.cpus', '1'))
-        max_cores = int(sc.getConf().get('spark.cores.max'))
-        exec_cores = int(sc.getConf().get('spark.executor.cores'))
-
-        expected_executors = int(max_cores / exec_cores)
-        expected_workers = expected_executors * int(exec_cores / max_nthread)
-
-        params.setdefault('nthread', max_nthread)
-        params.setdefault('nworkers', expected_workers)
-        params.setdefault('num_round', 10)  # Default from the python api
-
-        self._java_obj = sc._jvm.ml.dmlc.xgboost4j.scala.spark.XGBoostEstimator(
+        self._paramMap = params
+        self._java_obj = self._new_java_obj(
+            self._java_classname(),
             sc._jvm.PythonUtils.toScalaMap(params),
         )
-        self._paramMap = params
+
+    @classmethod
+    def read(cls):
+        return XGBoostClassReader(cls)
 
     def _create_model(self, java_model):
         return XGBoostModel(java_model)
+
+    @classmethod
+    def _java_classname(cls):
+        return 'ml.dmlc.xgboost4j.scala.spark.XGBoostEstimator'
 
 
 class XGBoostModel(JavaModel, JavaMLReadable, JavaMLWritable):
@@ -77,12 +97,15 @@ class XGBoostModel(JavaModel, JavaMLReadable, JavaMLWritable):
 
         :param str path: Path to save model to.
         """
-        self._java_obj.booster().saveModel(path)
+        if 'booster' in dir(self._java_obj):
+            self._java_obj.booster().saveModel(path)
+        else:
+            # Compatible with https://github.com/dmlc/xgboost/pull/3387
+            self._java_obj._booster().saveModel(path)
 
-    @staticmethod
-    def load_booster(path, cls='ml.dmlc.xgboost4j.scala.spark.XGBoostRegressionModel'):
-        """Loads an XGBoostModel instance from the booster at the specified filename. By default
-        loads a regression model but a different class can be provided with the cls kwarg.
+    @classmethod
+    def load_booster(cls, path):
+        """Loads an XGBoostModel instance from the booster at the specified filename.
 
         :param str path: File to load booster instance from.
         :return XGBoostModel: Instance which wraps the loaded booster for distributed use.
@@ -90,7 +113,7 @@ class XGBoostModel(JavaModel, JavaMLReadable, JavaMLWritable):
         sc = SparkContext.getOrCreate()
         java_booster = sc._jvm.ml.dmlc.xgboost4j.java.XGBoost.loadModel(path)
         scala_booster = sc._jvm.ml.dmlc.xgboost4j.scala.Booster(java_booster)
-        return XGBoostModel(JavaModel._new_java_obj(cls, scala_booster))
+        return cls(JavaModel._new_java_obj(cls._java_classname(), cls._randomUID(), scala_booster))
 
     @property
     def training_summary(self):
@@ -103,7 +126,7 @@ class XGBoostModel(JavaModel, JavaMLReadable, JavaMLWritable):
         Other options include 'logloss', 'auc', and 'ndcg'.
         https://xgboost.readthedocs.io/en/latest/parameter.html#learning-task-parameters
 
-        >>> model = XGboost({'trainTestRatio': 0.8}).fit(data)
+        >>> model = XGboost({'train_test_ratio': 0.8}).fit(data)
         >>> model.objective_history['train']
         [0.358666, 0.265099, ...]
         >>> model.objective_history['test']
@@ -119,16 +142,49 @@ class XGBoostModel(JavaModel, JavaMLReadable, JavaMLWritable):
 
     @classmethod
     def read(cls):
-        return XGBoostModelReader(cls)
+        return XGBoostClassReader(cls)
 
     @classmethod
     def _from_java(cls, java_model):
         return XGBoostModel(java_model)
 
-
-class XGBoostModelReader(JavaMLReader):
-    # See pyspark.ml.util.JavaMLReader._java_loader_class
-
     @classmethod
-    def _load_java_obj(cls, clazz):
-        return SparkContext._jvm.ml.dmlc.xgboost4j.scala.spark.XGBoostModel
+    def _java_classname(cls):
+        return 'ml.dmlc.xgboost4j.scala.spark.XGBoostRegressionModel'
+
+
+class XGBoostClassReader(JavaMLReader):
+    @classmethod
+    def _java_loader_class(cls, clazz):
+        return clazz._java_classname()
+
+
+# The following classes are for compatibility with https://github.com/dmlc/xgboost/pull/3387
+
+
+class XGBoostRegressor(XGBoost):
+    @classmethod
+    def _java_classname(cls):
+        return 'ml.dmlc.xgboost4j.scala.spark.XGBoostRegressor'
+
+    def _create_model(self, java_model):
+        return XGBoostRegressionModel(java_model)
+
+
+class XGBoostRegressionModel(XGBoostModel):
+    pass
+
+
+class XGBoostClassifier(XGBoost):
+    @classmethod
+    def _java_classname(cls):
+        return 'ml.dmlc.xgboost4j.scala.spark.XGBoostClassifier'
+
+    def _create_model(self, java_model):
+        return XGBoostClassificationModel(java_model)
+
+
+class XGBoostClassificationModel(XGBoostModel):
+    @classmethod
+    def _java_classname(cls):
+        return 'ml.dmlc.xgboost4j.scala.spark.XGBoostClassificationModel'
